@@ -33,9 +33,53 @@ def parse_channel_filters(value: str) -> Tuple[Set[str], Set[str]]:
 	return ids, usernames
 
 
+def load_aggregated_env_var(env_key: str = "WORKER_ENV_PAIRS") -> int:
+	raw = os.getenv(env_key, "").strip()
+	if not raw:
+		return 0
+
+	loaded_count = 0
+
+	# Format 1: JSON object string
+	if raw.startswith("{") and raw.endswith("}"):
+		try:
+			parsed = json.loads(raw)
+			if isinstance(parsed, dict):
+				for key, value in parsed.items():
+					if not isinstance(key, str):
+						continue
+					os.environ[key] = "" if value is None else str(value)
+					loaded_count += 1
+				return loaded_count
+		except json.JSONDecodeError:
+			# Fall back to line-based parser
+			pass
+
+	# Format 2: KEY=VALUE pairs separated by newlines or semicolons
+	normalized = raw.replace(";", "\n")
+	for line in normalized.splitlines():
+		entry = line.strip()
+		if not entry or entry.startswith("#") or "=" not in entry:
+			continue
+
+		key, value = entry.split("=", 1)
+		key = key.strip()
+		value = value.strip().strip('"').strip("'")
+		if not key:
+			continue
+
+		os.environ[key] = value
+		loaded_count += 1
+
+	return loaded_count
+
+
 class TelegramEventWorker:
 	def __init__(self) -> None:
 		load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "local.env"))
+		aggregated_loaded = load_aggregated_env_var("WORKER_ENV_PAIRS")
+		if aggregated_loaded > 0:
+			print(f"[INFO] Loaded {aggregated_loaded} env keys from WORKER_ENV_PAIRS")
 
 		self.bot_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 		self.mongo_uri = os.getenv("MONGODB_URI", "").strip()
