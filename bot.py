@@ -33,6 +33,17 @@ Agenda:
 Attach one image/photo to the same Telegram post."""
 
 
+def normalize_structured_text(text: str) -> str:
+	normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+	if len(normalized) >= 2:
+		if (normalized.startswith('"') and normalized.endswith('"')) or (
+			normalized.startswith("'") and normalized.endswith("'")
+		):
+			normalized = normalized[1:-1].strip()
+
+	return normalized
+
+
 def parse_csv_env(value: str) -> Iterable[str]:
 	return [item.strip() for item in value.split(",") if item.strip()]
 
@@ -319,21 +330,27 @@ class TelegramEventWorker:
 			"agenda",
 		}
 
-		lines = [line.rstrip() for line in text.splitlines()]
+		normalized_text = normalize_structured_text(text)
+		lines = [line.rstrip() for line in normalized_text.splitlines()]
 		parsed: Dict[str, Any] = {}
 		current_key: Optional[str] = None
+		recognized_keys = required_keys
 
 		for raw_line in lines:
 			line = raw_line.strip()
 			if not line:
 				continue
 
-			match = re.match(r"^([A-Za-z]+)\s*:\s*(.*)$", line)
+			match = re.match(r"^[\"']?([A-Za-z]+)\s*:\s*(.*)$", line)
 			if match:
 				key = match.group(1).strip().lower()
-				value = match.group(2).strip()
+				value = match.group(2).strip().strip('"').strip("'")
 
-				if key not in required_keys:
+				if key not in recognized_keys:
+					if current_key == "agenda":
+						parsed.setdefault("agenda", []).append(line.lstrip("-* ").strip())
+						continue
+
 					current_key = None
 					continue
 
@@ -347,8 +364,12 @@ class TelegramEventWorker:
 					current_key = key
 				continue
 
-			if current_key == "agenda" and (line.startswith("-") or line.startswith("*")):
-				item = line[1:].strip()
+			if current_key == "agenda":
+				item = line
+				if line.startswith("-") or line.startswith("*"):
+					item = line[1:].strip()
+
+				item = item.strip('"').strip("'").strip()
 				if item:
 					parsed.setdefault("agenda", []).append(item)
 
