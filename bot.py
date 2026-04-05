@@ -1,4 +1,5 @@
 import json
+import re
 import os
 import time
 from datetime import datetime, timezone
@@ -9,6 +10,27 @@ from dotenv import load_dotenv
 from pymongo import MongoClient
 from pymongo.collection import Collection
 from pymongo.errors import DuplicateKeyError
+
+
+STRICT_MODE_FORMAT_HELP = """Use this exact event post format (caption or message text):
+
+Title: Your event title
+Description: Short summary for cards
+Overview: Detailed event overview
+Venue: Exact venue name
+Location: City, area, or address
+Date: YYYY-MM-DD
+Time: HH:MM (24-hour)
+Mode: in-person | online | hybrid
+Audience: Target audience
+Organizer: Organizer name
+Tags: tag1, tag2, tag3
+Agenda:
+- Item one
+- Item two
+- Item three
+
+Attach one image/photo to the same Telegram post."""
 
 
 def parse_csv_env(value: str) -> Iterable[str]:
@@ -278,6 +300,100 @@ class TelegramEventWorker:
 		normalized = text.lower()
 		return any(keyword in normalized for keyword in self.keywords)
 
+	def parse_strict_event_format(self, text: str, image_url: Optional[str]) -> Optional[Dict[str, Any]]:
+		if not image_url:
+			return None
+
+		required_keys = {
+			"title",
+			"description",
+			"overview",
+			"venue",
+			"location",
+			"date",
+			"time",
+			"mode",
+			"audience",
+			"organizer",
+			"tags",
+			"agenda",
+		}
+
+		lines = [line.rstrip() for line in text.splitlines()]
+		parsed: Dict[str, Any] = {}
+		current_key: Optional[str] = None
+
+		for raw_line in lines:
+			line = raw_line.strip()
+			if not line:
+				continue
+
+			match = re.match(r"^([A-Za-z]+)\s*:\s*(.*)$", line)
+			if match:
+				key = match.group(1).strip().lower()
+				value = match.group(2).strip()
+
+				if key not in required_keys:
+					current_key = None
+					continue
+
+				if key == "agenda":
+					parsed.setdefault("agenda", [])
+					if value:
+						parsed["agenda"].append(value)
+					current_key = "agenda"
+				else:
+					parsed[key] = value
+					current_key = key
+				continue
+
+			if current_key == "agenda" and (line.startswith("-") or line.startswith("*")):
+				item = line[1:].strip()
+				if item:
+					parsed.setdefault("agenda", []).append(item)
+
+		missing = [key for key in required_keys if key not in parsed or not parsed.get(key)]
+		if missing:
+			return None
+
+		if not re.match(r"^\d{4}-\d{2}-\d{2}$", str(parsed["date"])):
+			return None
+
+		if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", str(parsed["time"])):
+			return None
+
+		mode = str(parsed["mode"]).strip().lower()
+		if mode not in {"in-person", "online", "hybrid"}:
+			return None
+
+		tags = [tag.strip().lower() for tag in str(parsed["tags"]).split(",") if tag.strip()]
+		agenda_items = [str(item).strip() for item in parsed.get("agenda", []) if str(item).strip()]
+
+		if not tags or not agenda_items:
+			return None
+
+		parsed_event = {
+			"title": str(parsed["title"]).strip(),
+			"description": str(parsed["description"]).strip(),
+			"overview": str(parsed["overview"]).strip(),
+			"venue": str(parsed["venue"]).strip(),
+			"location": str(parsed["location"]).strip(),
+			"date": str(parsed["date"]).strip(),
+			"time": str(parsed["time"]).strip(),
+			"mode": mode,
+			"audience": str(parsed["audience"]).strip(),
+			"organizer": str(parsed["organizer"]).strip(),
+			"tags": tags,
+			"agenda": agenda_items,
+			"image": image_url,
+		}
+
+		for value in parsed_event.values():
+			if isinstance(value, str) and not value.strip():
+				return None
+
+		return parsed_event
+
 	def extract_basic_fields(self, text: str) -> Tuple[str, str]:
 		lines = [line.strip() for line in text.splitlines() if line.strip()]
 		if lines:
@@ -342,8 +458,7 @@ class TelegramEventWorker:
 	def insert_pending_event(
 		self,
 		raw_doc: Dict[str, Any],
-		title: str,
-		description: str,
+		parsed_event: Dict[str, Any],
 		source: str,
 	) -> bool:
 		pending_doc = {
@@ -352,11 +467,12 @@ class TelegramEventWorker:
 			"sourceChannelId": raw_doc["sourceChannelId"],
 			"source": source,
 			"telegramMessageId": raw_doc["telegramMessageId"],
-			"title": title,
-			"description": description,
+			"title": parsed_event["title"],
+			"description": parsed_event["description"],
 			"image": raw_doc.get("imageUrl"),
-			"eventDate": None,
+			"eventDate": parsed_event["date"],
 			"originalMessage": raw_doc.get("text", ""),
+			"parsedEvent": parsed_event,
 			"status": "pending",
 			"createdAt": datetime.now(tz=timezone.utc),
 			"updatedAt": datetime.now(tz=timezone.utc),
@@ -436,12 +552,24 @@ class TelegramEventWorker:
 			return
 
 		self.log("INFO", f"Keyword filter hit fingerprint={fingerprint}")
-		title, description = self.extract_basic_fields(text)
+		parsed_event = self.parse_strict_event_format(text=text, image_url=image_url)
+		if not parsed_event:
+			self.log(
+				"INFO",
+				f"Strict format mismatch or missing image. Skipping pending event fingerprint={fingerprint}",
+			)
+			self.log_verbose(STRICT_MODE_FORMAT_HELP)
+			return
+
 		source = self.build_source(chat)
-		inserted = self.insert_pending_event(raw_doc=raw_doc, title=title, description=description, source=source)
+		inserted = self.insert_pending_event(raw_doc=raw_doc, parsed_event=parsed_event, source=source)
 
 		if inserted:
-			self.notify_pending_event(title=title, source=source, fingerprint=raw_doc["fingerprint"])
+			self.notify_pending_event(
+				title=parsed_event["title"],
+				source=source,
+				fingerprint=raw_doc["fingerprint"],
+			)
 			self.log("INFO", f"Pending event created: {raw_doc['fingerprint']}")
 
 	def run(self) -> None:
